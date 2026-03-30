@@ -1,0 +1,360 @@
+# ==============================================================================
+# E-COMMERCE CONVERSION MODELING & STATISTICAL ANALYSIS
+# ==============================================================================
+
+# Load packages
+library(tidyverse)
+library(lubridate)
+library(mice)
+library(scales)
+library(broom)
+library(car)
+
+# ---------------------------------------------------------
+# 1. MERGING THE DATA 
+# ---------------------------------------------------------
+
+# 1. Load & clean weather data
+weather_data <- read.delim("data/knmi_data.txt", sep = ",")
+
+weather_data <- weather_data %>%
+  select(YYYYMMDD, TX, SQ, DR) %>%
+  mutate(
+    Date = as.Date(as.character(YYYYMMDD), format = "%Y%m%d")
+  ) %>%
+  filter(Date >= as.Date("2022-01-01") & Date <= as.Date("2023-12-31")) %>%
+  select(-YYYYMMDD)
+
+# 2. Load ecommerce base data
+ecommerce_data <- read.csv("data/resultsfinal.csv") %>%
+  mutate(session_date = as.Date(session_date))
+
+# 3. Load search trends/views data
+views_data <- read.csv("data/viewsdata.csv") %>%
+  mutate(
+    date = as.Date(week_date),
+    year = year(date),
+    week = week(date)
+  )
+
+# 4. Merge ecommerce + views
+new_data <- ecommerce_data %>%
+  mutate(
+    year = year(session_date),
+    week = week(session_date)
+  )
+
+merged_data <- new_data %>%
+  left_join(views_data, by = c("year", "week")) %>%
+  select(-year, -week, -focal_brand, -week_date, -total_market, -date)
+
+write.csv(merged_data, "data/merged_data.csv", row.names = FALSE)
+
+# ---------------------------------------------------------
+# 2. CHECKING FOR OUTLIERS (MAHALANOBIS)
+# ---------------------------------------------------------
+
+data <- read.csv("data/merged_data.csv", sep = ",", quote = "", header = TRUE)
+
+# Keep only numeric columns 
+num_data <- data[, sapply(data, is.numeric), drop = FALSE]
+
+# Remove one dummy per dummy set 
+x <- subset(
+  num_data,
+  select = -c(
+    X..geom_household_age1....25.years..,
+    X..geom_clothing_budget2..Below.average..
+  )
+)
+
+# Calculate variance matrix 
+Sx <- cov(x)
+
+# Calculate Mahalanobis distance 
+D2 <- mahalanobis(x, colMeans(x), Sx)
+
+# Plot Chi-square distribution with df = 24
+cutoff <- qchisq(0.999, df = ncol(x))
+
+# Identify outlier rows
+outlier_rows <- which(D2 > cutoff)
+normal_rows <- which(D2 <= cutoff)
+
+# Compare means of variables
+outlier_means <- colMeans(x[outlier_rows, ])
+normal_means <- colMeans(x[normal_rows, ])
+
+comparison <- data.frame(
+  Variable = names(x),
+  Outlier_mean = outlier_means,
+  Normal_mean = normal_means,
+  Difference = abs(outlier_means - normal_means)
+)
+comparison_sorted <- comparison[order(-comparison$Difference), ]
+
+print(paste("Rows in original data:", nrow(data)))
+print(paste("Number of outliers identified:", length(outlier_rows)))
+print(paste("Percentage of data as outliers:", round(length(outlier_rows)/nrow(x)*100, 2), "%"))
+
+# ---------------------------------------------------------
+# 3. IMPUTING MISSING DATA WITH MICE
+# ---------------------------------------------------------
+
+ecommerce_data <- read_csv("data/merged_data.csv")
+
+# Convert missing values to NA
+ecommerce_data[] <- lapply(ecommerce_data, function(x) {
+  if (is.character(x)) {
+    x[x %in% c("NULL", "Unknown", "unknown", "")] <- NA
+  }
+  x
+})
+
+# Convert variables to correct type
+ecommerce_data$internet_session_id  <- as.character(ecommerce_data$internet_session_id)
+ecommerce_data$customer_id          <- as.character(ecommerce_data$customer_id)
+ecommerce_data$session_date         <- as.Date(ecommerce_data$session_date)
+
+ecommerce_data$device_category_desc <- as.factor(ecommerce_data$device_category_desc)
+ecommerce_data$geom_household_age   <- as.factor(ecommerce_data$geom_household_age)
+ecommerce_data$geom_clothing_budget <- as.factor(ecommerce_data$geom_clothing_budget)
+ecommerce_data$geom_reads_newspaper <- as.factor(ecommerce_data$geom_reads_newspaper)
+ecommerce_data$focal_brand_share    <- as.numeric(ecommerce_data$focal_brand_share)
+
+final_data <- ecommerce_data
+
+imp_data <- ecommerce_data[, c(
+  "focal_brand_share",
+  "device_category_desc",
+  "geom_household_age",
+  "geom_clothing_budget",
+  "geom_reads_newspaper"
+)]
+
+imp_data$device_category_desc <- droplevels(imp_data$device_category_desc)
+imp_data$geom_household_age   <- droplevels(imp_data$geom_household_age)
+imp_data$geom_clothing_budget <- droplevels(imp_data$geom_clothing_budget)
+imp_data$geom_reads_newspaper <- droplevels(imp_data$geom_reads_newspaper)
+
+# Initialize MICE
+ini <- mice(imp_data, maxit = 0, printFlag = FALSE)
+meth <- ini$method
+pred <- ini$predictorMatrix
+
+meth["focal_brand_share"]    <- "pmm"
+meth["device_category_desc"] <- "polyreg"
+meth["geom_household_age"]   <- "polyreg"
+meth["geom_clothing_budget"] <- "polyreg"
+
+n_levels_newspaper <- nlevels(droplevels(imp_data$geom_reads_newspaper))
+if (n_levels_newspaper == 2) {
+  meth["geom_reads_newspaper"] <- "logreg"
+} else {
+  meth["geom_reads_newspaper"] <- "polyreg"
+}
+
+# Run MICE
+imp <- mice(imp_data, method = meth, predictorMatrix = pred, m = 1, maxit = 5, seed = 123, printFlag = FALSE)
+completed_part <- complete(imp, 1)
+
+final_data$focal_brand_share    <- completed_part$focal_brand_share
+final_data$device_category_desc <- completed_part$device_category_desc
+final_data$geom_household_age   <- completed_part$geom_household_age
+final_data$geom_clothing_budget <- completed_part$geom_clothing_budget
+final_data$geom_reads_newspaper <- completed_part$geom_reads_newspaper
+
+write_csv(final_data, "data/merged_data_imputed.csv")
+
+# ---------------------------------------------------------
+# 4. FINAL DATA PREP & WEATHER MERGE
+# ---------------------------------------------------------
+
+ecommerce_data_imputed <- read.csv("data/merged_data_imputed.csv") %>%
+  mutate(session_date = as.Date(session_date))
+
+final_data <- ecommerce_data_imputed %>%
+  left_join(weather_data, by = c("session_date" = "Date"))
+
+write.csv(final_data, "data/final_data.csv", row.names = FALSE)
+
+
+# ==============================================================================
+# HYPOTHESIS TESTING & LOGISTIC REGRESSION MODELING
+# ==============================================================================
+
+final_data <- read.csv("data/final_data.csv")
+
+# Ensure numeric format for KPIs
+final_data <- final_data %>%
+  mutate(
+    converted = as.numeric(as.character(converted)),
+    session_brand_weight = as.numeric(session_brand_weight),
+    focal_brand_share = as.numeric(focal_brand_share),
+    num_distinct_class_3 = as.numeric(num_distinct_class_3)
+  )
+
+# --- HYPOTHESIS 1: Household Age ---
+contingency_h1 <- table(final_data$converted, final_data$geom_household_age)
+chisq.test(contingency_h1)
+
+# --- HYPOTHESIS 2: Clothing Budget ---
+contingency_h2 <- table(final_data$converted, final_data$geom_clothing_budget)
+chisq.test(contingency_h2)
+
+# --- HYPOTHESIS 3: Newspaper Readership ---
+contingency_h3 <- table(final_data$converted, final_data$geom_reads_newspaper)
+chisq.test(contingency_h3)
+
+# --- HYPOTHESIS 4: Brand Familiarity ---
+model_h4 <- glm(converted ~ session_brand_weight, data = final_data, family = binomial)
+summary(model_h4)
+
+# --- HYPOTHESIS 5, 6, 7: Weather (Sunlight, Temp, Rain) ---
+summary(glm(converted ~ SQ, data = final_data, family = binomial))
+summary(glm(converted ~ TX, data = final_data, family = binomial))
+summary(glm(converted ~ DR, data = final_data, family = binomial))
+
+# --- HYPOTHESIS 8: Weekend ---
+contingency_h8 <- table(final_data$converted, final_data$is_weekend)
+chisq.test(contingency_h8)
+summary(glm(converted ~ is_weekend, data = final_data, family = binomial))
+
+# --- HYPOTHESIS 9: National Holidays ---
+dutch_holidays_dates <- as.Date(c(
+  "2022-01-01", "2022-04-17", "2022-04-18", "2022-04-27", "2022-05-05", 
+  "2022-05-26", "2022-06-05", "2022-06-06", "2022-12-25", "2022-12-26",
+  "2023-01-01", "2023-04-09", "2023-04-10", "2023-04-27", "2023-05-05", 
+  "2023-05-18", "2023-05-28", "2023-05-29", "2023-12-25", "2023-12-26"
+))
+final_data$is_holiday <- as.factor(ifelse(as.Date(final_data$session_date) %in% dutch_holidays_dates, 1, 0))
+chisq.test(table(final_data$is_holiday, final_data$converted))
+
+# --- HYPOTHESIS 10: Browsing Variety ---
+contingency_h10 <- table(final_data$converted, final_data$num_distinct_class_3)
+chisq.test(contingency_h10)
+summary(glm(converted ~ num_distinct_class_3, data = final_data, family = binomial))
+
+# --- HYPOTHESIS 11: Device Category ---
+final_data$device_category_desc <- as.factor(final_data$device_category_desc)
+contingency_h11 <- table(final_data$converted, final_data$device_category_desc)
+chisq.test(contingency_h11)
+summary(glm(converted ~ device_category_desc, data = final_data, family = binomial))
+
+# --- HYPOTHESIS 12: Competitive Share ---
+model_h12 <- glm(converted ~ focal_brand_share, data = final_data, family = binomial)
+summary(model_h12)
+
+
+# ==============================================================================
+# FINAL MULTIVARIABLE MODEL & COLLINEARITY CHECK
+# ==============================================================================
+
+final_model_data <- final_data %>%
+  mutate(
+    converted = as.numeric(as.character(converted)),
+    is_weekend = as.factor(as.character(is_weekend)),
+    device_category_desc = as.factor(as.character(device_category_desc)),
+    geom_household_age = as.factor(as.character(geom_household_age)),
+    geom_clothing_budget = as.factor(as.character(geom_clothing_budget)),
+    geom_reads_newspaper = as.factor(as.character(geom_reads_newspaper)),
+    session_brand_weight = as.numeric(session_brand_weight),
+    SQ = as.numeric(SQ),
+    TX = as.numeric(TX),
+    DR = as.numeric(DR),
+    num_distinct_class_3 = as.numeric(num_distinct_class_3),
+    focal_brand_share = as.numeric(focal_brand_share)
+  )
+
+# Final logistic regression
+final_model <- glm(
+  converted ~ session_brand_weight +
+    num_distinct_class_3 +
+    device_category_desc +
+    is_weekend +
+    SQ + TX + DR +
+    focal_brand_share +
+    geom_household_age +
+    geom_clothing_budget +
+    geom_reads_newspaper,
+  data = final_model_data,
+  family = binomial,
+  na.action = na.exclude
+)
+
+summary(final_model)
+
+# Collinearity Check (VIF)
+v <- vif(final_model)
+if (is.matrix(v)) {
+  adjusted_vif <- v[, "GVIF"]^(1 / (2 * v[, "Df"]))
+  vif_table <- data.frame(
+    Variable = rownames(v),
+    GVIF = v[, "GVIF"],
+    Df = v[, "Df"],
+    Adjusted_VIF = adjusted_vif
+  )
+  print(vif_table)
+} else {
+  vif_table <- data.frame(Variable = names(v), VIF = as.numeric(v))
+  print(vif_table)
+}
+
+# Clean Regression Table
+model_table <- tidy(final_model) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    p.value = round(p.value, 4)
+  )
+
+# ---------------------------------------------------------
+# VISUALIZATION: MAIN PREDICTORS 
+# ---------------------------------------------------------
+
+main_plot_data <- tidy(final_model) %>%
+  filter(term %in% c(
+    "session_brand_weight",
+    "num_distinct_class_3",
+    "device_category_descmobile",
+    "device_category_desctablet",
+    "is_weekend1",
+    "SQ",
+    "TX",
+    "DR",
+    "focal_brand_share"
+  )) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    term = dplyr::recode(
+      term,
+      "session_brand_weight" = "Brand familiarity",
+      "num_distinct_class_3" = "Browsing variety",
+      "device_category_descmobile" = "Mobile (vs desktop)",
+      "device_category_desctablet" = "Tablet (vs desktop)",
+      "is_weekend1" = "Weekend",
+      "SQ" = "Sunlight duration",
+      "TX" = "Temperature",
+      "DR" = "Rainfall duration",
+      "focal_brand_share" = "Focal brand share"
+    )
+  )
+
+ggplot(main_plot_data, aes(x = odds_ratio, y = reorder(term, odds_ratio))) +
+  geom_point(size = 3, color = "steelblue4") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "firebrick") +
+  labs(
+    title = "Main predictors from the final multivariable model",
+    subtitle = "Odds ratios from the final multivariable logistic regression",
+    x = "Odds ratio (log scale)",
+    y = NULL,
+    caption = "Note. Odds ratios above 1 indicate higher conversion odds; values below 1 indicate lower conversion odds."
+  ) +
+  scale_x_log10() +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    plot.caption = element_text(size = 8.5, hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
