@@ -1,0 +1,108 @@
+/* =====================================================================
+   E-COMMERCE DATA PIPELINE: SESSION AGGREGATION & FEATURE ENGINEERING
+===================================================================== */
+
+DROP TABLE IF EXISTS sessions_enriched;
+CREATE TEMP TABLE sessions_enriched AS
+
+WITH brand_weights AS (
+  SELECT
+    DATE_TRUNC('month', e.internet_session_dtime) AS session_month,
+    a.brand_name,
+    COUNT(*)::float / SUM(COUNT(*)) OVER (PARTITION BY DATE_TRUNC('month', e.internet_session_dtime)) AS brand_weight
+  FROM raw_events e
+  JOIN product_catalog a
+    ON e.article_id = a.article_id
+  WHERE e.action_type_desc = 'purchase'
+  GROUP BY DATE_TRUNC('month', e.internet_session_dtime), a.brand_name
+),
+
+session_brands AS (
+  SELECT DISTINCT
+    e.internet_session_id,
+    DATE_TRUNC('month', e.internet_session_dtime) AS session_month,
+    a.brand_name
+  FROM raw_events e
+  JOIN product_catalog a
+    ON e.article_id = a.article_id
+),
+
+session_brand_scores AS (
+  SELECT
+    sb.internet_session_id,
+    MAX(bw.brand_weight) AS session_brand_weight
+  FROM session_brands sb
+  JOIN brand_weights bw
+    ON sb.session_month = bw.session_month
+    AND sb.brand_name = bw.brand_name
+  GROUP BY sb.internet_session_id
+),
+
+session_converted AS (
+  SELECT
+    internet_session_id,
+    CASE
+      WHEN SUM(CASE WHEN action_type_desc = 'purchase' THEN 1 ELSE 0 END) > 0
+      THEN 1 ELSE 0
+    END AS converted
+  FROM raw_events
+  GROUP BY internet_session_id
+)
+
+SELECT
+  e.internet_session_id,
+  CAST(MIN(e.internet_session_dtime) AS DATE) AS session_date,
+  MIN(e.customer_id) AS customer_id,
+  e.device_category_desc,
+  CASE
+    WHEN EXTRACT(DOW FROM MIN(e.internet_session_dtime)) IN (0,6)
+    THEN 1 ELSE 0
+  END AS is_weekend,
+  COUNT(DISTINCT a.class_3) AS num_distinct_class_3,
+  COUNT(*) AS total_events,
+  COALESCE(sbs.session_brand_weight, 0) AS session_brand_weight,
+  c.geom_household_age,
+  c.geom_clothing_budget,
+  c.geom_reads_newspaper,
+  sc.converted
+FROM raw_events e
+LEFT JOIN product_catalog a
+  ON e.article_id = a.article_id
+LEFT JOIN session_brand_scores sbs
+  ON sbs.internet_session_id = e.internet_session_id
+LEFT JOIN customer_profiles c
+  ON c.customer_id = e.customer_id
+LEFT JOIN session_converted sc
+  ON sc.internet_session_id = e.internet_session_id
+GROUP BY
+  e.internet_session_id,
+  e.device_category_desc,
+  sbs.session_brand_weight,
+  c.geom_household_age,
+  c.geom_clothing_budget,
+  c.geom_reads_newspaper,
+  sc.converted;
+
+SELECT * FROM sessions_enriched;
+
+/* ==========================================
+   KPI / SANITY CHECKS FOR SQL PIPELINE
+   Run these AFTER creating sessions_enriched
+========================================== */
+
+/* 1) Total number of rows in final session table */
+SELECT COUNT(*) AS n_sessions
+FROM sessions_enriched;
+
+/* 2) Overall conversion rate */
+SELECT ROUND(100.0 * AVG(converted), 2) AS overall_conversion_pct
+FROM sessions_enriched;
+
+/* 3) Conversion rate by year */
+SELECT
+  EXTRACT(YEAR FROM session_date) AS year,
+  COUNT(*) AS n_sessions,
+  ROUND(100.0 * AVG(converted), 2) AS conversion_pct
+FROM sessions_enriched
+GROUP BY EXTRACT(YEAR FROM session_date)
+ORDER BY year;
